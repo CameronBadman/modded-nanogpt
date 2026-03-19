@@ -70,8 +70,8 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 1024))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    model_dim = int(os.environ.get("MODEL_DIM", 1536))
+    num_heads = int(os.environ.get("NUM_HEADS", 12))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -99,7 +99,7 @@ class Hyperparameters:
     # Set USE_RECURRENT=0 to fall back to the baseline 9-block GPT.
     use_recurrent = bool(int(os.environ.get("USE_RECURRENT", "1")))
     # Number of times the single base block is applied.
-    num_recurrent_passes = int(os.environ.get("NUM_RECURRENT_PASSES", "16"))
+    num_recurrent_passes = int(os.environ.get("NUM_RECURRENT_PASSES", "24"))
     # Rank of per-pass low-rank corrector.
     delta_rank = int(os.environ.get("DELTA_RANK", "8"))
     # QuadTree depth for delta corrector weights.
