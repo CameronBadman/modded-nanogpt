@@ -100,11 +100,9 @@ class Hyperparameters:
     use_recurrent = bool(int(os.environ.get("USE_RECURRENT", "1")))
     # Number of times the single base block is applied.
     num_recurrent_passes = int(os.environ.get("NUM_RECURRENT_PASSES", "16"))
-    # QuadTree depth for base block weights (level 0..L, so L+1 grids).
-    quadtree_levels = int(os.environ.get("QUADTREE_LEVELS", "8"))
     # Rank of per-pass low-rank corrector.
     delta_rank = int(os.environ.get("DELTA_RANK", "8"))
-    # QuadTree depth for delta corrector weights (coarser than base).
+    # QuadTree depth for delta corrector weights.
     delta_quadtree_levels = int(os.environ.get("DELTA_QUADTREE_LEVELS", "5"))
     # Truncated BPTT: detach hidden state every this many passes (0 = full BPTT).
     tbptt_chunk = int(os.environ.get("TBPTT_CHUNK", "4"))
@@ -591,14 +589,14 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init):
+    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, depth_scale: float = 1.0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.full((dim,), depth_scale, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.full((dim,), depth_scale, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
@@ -903,7 +901,6 @@ class RecurrentGPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        qt_levels: int,
         delta_rank: int,
         delta_qt_levels: int,
         tbptt_chunk: int = 4,
@@ -920,8 +917,8 @@ class RecurrentGPT(nn.Module):
         if tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=tied_embed_init_std)
 
-        self.base_block = QTBlock(
-            model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, qt_levels,
+        self.base_block = Block(
+            model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
             depth_scale=1.0 / math.sqrt(num_passes),
         )
         self.pass_deltas = nn.ModuleList([
@@ -933,7 +930,7 @@ class RecurrentGPT(nn.Module):
         if tie_embeddings:
             self.lm_head = None
         else:
-            self.lm_head = QuadTreeLinear(model_dim, vocab_size, num_levels=qt_levels, init_std=0.0)
+            self.lm_head = CastedLinear(model_dim, vocab_size, bias=False)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1058,8 +1055,7 @@ def main() -> None:
     if args.use_recurrent:
         log0(
             f"architecture:recurrent_gpt num_passes:{args.num_recurrent_passes} "
-            f"qt_levels:{args.quadtree_levels} delta_rank:{args.delta_rank} "
-            f"delta_qt_levels:{args.delta_quadtree_levels} "
+            f"delta_rank:{args.delta_rank} delta_qt_levels:{args.delta_quadtree_levels} "
             f"tbptt_chunk:{args.tbptt_chunk}"
         )
         base_model = RecurrentGPT(
@@ -1074,42 +1070,48 @@ def main() -> None:
             logit_softcap=args.logit_softcap,
             rope_base=args.rope_base,
             qk_gain_init=args.qk_gain_init,
-            qt_levels=args.quadtree_levels,
             delta_rank=args.delta_rank,
             delta_qt_levels=args.delta_quadtree_levels,
             tbptt_chunk=args.tbptt_chunk,
         ).to(device).bfloat16()
+        # Keep CastedLinear weights in fp32 (same as baseline GPT)
+        for module in base_model.base_block.modules():
+            if isinstance(module, CastedLinear):
+                module.float()
         restore_low_dim_params_to_fp32(base_model)
 
-        # All QuadTree vals are 1D → Adam (scalar optimizer).
-        # Separate embedding from the rest.
+        # base_block 2D weights → Muon (same as baseline)
+        # pass_deltas QuadTree vals + all scalars/vectors → Adam
+        base_block_matrix_params = [
+            p for name, p in base_model.base_block.named_parameters()
+            if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
+        ]
+        scalar_params = [
+            p for name, p in base_model.named_parameters()
+            if "tok_emb" not in name
+            and (base_model.lm_head is None or "lm_head" not in name)
+            and id(p) not in {id(q) for q in base_block_matrix_params}
+        ]
         token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
         optimizer_tok = torch.optim.Adam(
             [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
+            betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
         )
-        other_params = [
-            p for name, p in base_model.named_parameters()
-            if "tok_emb" not in name and (base_model.lm_head is None or "lm_head" not in name)
-        ]
         optimizer_scalar = torch.optim.Adam(
-            [{"params": other_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
+            [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
         )
-        optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_scalar]
+        optimizer_muon = Muon(
+            [{"params": base_block_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
+            lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps,
+        )
+        optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_scalar, optimizer_muon]
         if base_model.lm_head is not None:
             optimizer_head = torch.optim.Adam(
                 [{"params": list(base_model.lm_head.parameters()), "lr": args.head_lr, "base_lr": args.head_lr}],
-                betas=(args.beta1, args.beta2),
-                eps=args.adam_eps,
-                fused=True,
+                betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
             )
             optimizers.insert(1, optimizer_head)
-        optimizer_muon = None
 
     else:
         log0("architecture:gpt (baseline)")
