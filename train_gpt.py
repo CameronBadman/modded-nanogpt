@@ -818,14 +818,14 @@ class QTMLP(nn.Module):
 class QTBlock(nn.Module):
     """Transformer block backed entirely by QuadTreeLinear projections."""
 
-    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, qt_levels):
+    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, qt_levels, depth_scale: float = 1.0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = QTCausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, qt_levels)
         self.mlp = QTMLP(dim, mlp_mult, qt_levels)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.full((dim,), depth_scale, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.full((dim,), depth_scale, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
@@ -917,7 +917,8 @@ class RecurrentGPT(nn.Module):
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=tied_embed_init_std)
 
         self.base_block = QTBlock(
-            model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, qt_levels
+            model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, qt_levels,
+            depth_scale=1.0 / math.sqrt(num_passes),
         )
         self.pass_deltas = nn.ModuleList([
             PassDelta(model_dim, delta_rank, delta_qt_levels)
