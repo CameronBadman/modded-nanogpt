@@ -1162,7 +1162,7 @@ def main() -> None:
             )
             optimizers.insert(1, optimizer_head)
 
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False, options={"max_fusion_size": 4})
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     n_params = sum(p.numel() for p in base_model.parameters())
