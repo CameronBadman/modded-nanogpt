@@ -106,6 +106,8 @@ class Hyperparameters:
     delta_rank = int(os.environ.get("DELTA_RANK", "4"))
     # QuadTree depth for delta corrector weights (coarser than base).
     delta_quadtree_levels = int(os.environ.get("DELTA_QUADTREE_LEVELS", "3"))
+    # Truncated BPTT: detach hidden state every this many passes (0 = full BPTT).
+    tbptt_chunk = int(os.environ.get("TBPTT_CHUNK", "4"))
 
 
 # -----------------------------
@@ -904,11 +906,13 @@ class RecurrentGPT(nn.Module):
         qt_levels: int,
         delta_rank: int,
         delta_qt_levels: int,
+        tbptt_chunk: int = 4,
     ) -> None:
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.num_passes = num_passes
+        self.tbptt_chunk = tbptt_chunk
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
 
@@ -938,6 +942,10 @@ class RecurrentGPT(nn.Module):
         for i in range(self.num_passes):
             x = self.base_block(x, x0)
             x = x + self.pass_deltas[i](x)
+            # Truncated BPTT: stop gradient flow between chunks of passes so
+            # backprop only unrolls through `tbptt_chunk` steps at a time.
+            if self.tbptt_chunk > 0 and (i + 1) % self.tbptt_chunk == 0 and (i + 1) < self.num_passes:
+                x = x.detach()
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -1051,7 +1059,8 @@ def main() -> None:
         log0(
             f"architecture:recurrent_gpt num_passes:{args.num_recurrent_passes} "
             f"qt_levels:{args.quadtree_levels} delta_rank:{args.delta_rank} "
-            f"delta_qt_levels:{args.delta_quadtree_levels}"
+            f"delta_qt_levels:{args.delta_quadtree_levels} "
+            f"tbptt_chunk:{args.tbptt_chunk}"
         )
         base_model = RecurrentGPT(
             vocab_size=args.vocab_size,
@@ -1068,6 +1077,7 @@ def main() -> None:
             qt_levels=args.quadtree_levels,
             delta_rank=args.delta_rank,
             delta_qt_levels=args.delta_quadtree_levels,
+            tbptt_chunk=args.tbptt_chunk,
         ).to(device).bfloat16()
         restore_low_dim_params_to_fp32(base_model)
 
