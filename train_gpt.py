@@ -74,6 +74,8 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 1536))
     num_heads = int(os.environ.get("NUM_HEADS", 12))
     mlp_mult = int(os.environ.get("MLP_MULT", 3))
+    mlp_style = os.environ.get("MLP_STYLE", "dense")
+    butterfly_block_size = int(os.environ.get("BUTTERFLY_BLOCK_SIZE", 64))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -690,13 +692,97 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class ButterflyLinear(nn.Module):
+    """
+    Butterfly-inspired linear map using two block-diagonal mixing stages with a
+    fixed shuffle in between. This is cheaper in parameters than a dense matrix
+    while still allowing cross-block communication.
+    """
+
+    def __init__(self, in_features: int, out_features: int, block_size: int, bias: bool = False) -> None:
+        super().__init__()
+        if in_features % block_size != 0:
+            raise ValueError(f"in_features={in_features} must be divisible by block_size={block_size}")
+        if out_features % block_size != 0:
+            raise ValueError(f"out_features={out_features} must be divisible by block_size={block_size}")
+        self.in_features = in_features
+        self.out_features = out_features
+        self.block_size = block_size
+        self.n_in_blocks = in_features // block_size
+        self.n_out_blocks = out_features // block_size
+
+        self.stage1 = nn.Parameter(torch.empty(self.n_in_blocks * block_size, block_size))
+        self.stage2 = nn.Parameter(torch.empty(self.n_out_blocks * block_size, block_size))
+        self.mix = CastedLinear(self.n_in_blocks * block_size, self.n_out_blocks * block_size, bias=bias)
+        self.mix._zero_init = False
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        bound = 1.0 / math.sqrt(self.block_size)
+        with torch.no_grad():
+            self.stage1.uniform_(-bound, bound)
+            self.stage2.uniform_(-bound, bound)
+        nn.init.normal_(self.mix.weight, mean=0.0, std=1.0 / math.sqrt(self.in_features))
+        if self.mix.bias is not None:
+            nn.init.zeros_(self.mix.bias)
+
+    def _apply_blockdiag(self, x: Tensor, weight: Tensor, num_blocks: int) -> Tensor:
+        shape = x.shape[:-1]
+        x = x.reshape(-1, num_blocks, self.block_size)
+        weight = weight.view(num_blocks, self.block_size, self.block_size)
+        x = torch.einsum("ngc,gcd->ngd", x, weight.to(x.dtype))
+        return x.reshape(*shape, -1)
+
+    def _shuffle(self, x: Tensor) -> Tensor:
+        shape = x.shape[:-1]
+        x = x.reshape(-1, self.block_size, self.n_in_blocks).transpose(1, 2).contiguous()
+        return x.reshape(*shape, -1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self._apply_blockdiag(x, self.stage1, self.n_in_blocks)
+        x = self._shuffle(x)
+        x = self.mix(x)
+        x = self._apply_blockdiag(x, self.stage2, self.n_out_blocks)
+        return x
+
+
+class ButterflyMLP(nn.Module):
+    """relu^2 MLP with butterfly-inspired structured projections."""
+
+    def __init__(self, dim: int, mlp_mult: int, block_size: int):
+        super().__init__()
+        hidden = mlp_mult * dim
+        self.fc = ButterflyLinear(dim, hidden, block_size=block_size, bias=False)
+        self.proj = ButterflyLinear(hidden, dim, block_size=block_size, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = torch.relu(self.fc(x))
+        return self.proj(x.square())
+
+
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, depth_scale: float = 1.0):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        num_kv_heads,
+        mlp_mult,
+        rope_base,
+        qk_gain_init,
+        depth_scale: float = 1.0,
+        mlp_style: str = "dense",
+        butterfly_block_size: int = 64,
+    ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        if mlp_style == "dense":
+            self.mlp = MLP(dim, mlp_mult)
+        elif mlp_style == "butterfly":
+            self.mlp = ButterflyMLP(dim, mlp_mult, butterfly_block_size)
+        else:
+            raise ValueError(f"Unsupported MLP_STYLE={mlp_style!r}")
         self.attn_scale = nn.Parameter(torch.full((dim,), depth_scale, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.full((dim,), depth_scale, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -1024,6 +1110,8 @@ class RecurrentGPT(nn.Module):
         qk_gain_init: float,
         delta_rank: int,
         delta_mode: str = "per_pass",
+        mlp_style: str = "dense",
+        butterfly_block_size: int = 64,
         tbptt_chunk: int = 4,
     ) -> None:
         super().__init__()
@@ -1035,6 +1123,7 @@ class RecurrentGPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.delta_mode = delta_mode
         self.shared_delta: nn.Module | None = None
+        self.mlp_style = mlp_style
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         if tie_embeddings:
@@ -1043,6 +1132,8 @@ class RecurrentGPT(nn.Module):
         self.base_block = Block(
             model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
             depth_scale=1.0 / math.sqrt(num_passes),
+            mlp_style=mlp_style,
+            butterfly_block_size=butterfly_block_size,
         )
         self.pass_deltas = nn.ModuleList(self._build_pass_deltas(model_dim, delta_rank))
         # Per-pass embeddings: tell the shared block which pass it is executing.
@@ -1201,7 +1292,7 @@ def main() -> None:
     log0(
         f"architecture:recurrent_gpt num_passes:{args.num_recurrent_passes} "
         f"delta_mode:{args.delta_mode} delta_rank:{args.delta_rank} "
-        f"pass_emb:yes tbptt_chunk:{args.tbptt_chunk}"
+        f"mlp_style:{args.mlp_style} pass_emb:yes tbptt_chunk:{args.tbptt_chunk}"
     )
     base_model = RecurrentGPT(
         vocab_size=args.vocab_size,
@@ -1217,6 +1308,8 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         delta_rank=args.delta_rank,
         delta_mode=args.delta_mode,
+        mlp_style=args.mlp_style,
+        butterfly_block_size=args.butterfly_block_size,
         tbptt_chunk=args.tbptt_chunk,
     ).to(device).bfloat16()
     for module in base_model.modules():
