@@ -5,6 +5,9 @@ decreases over a few gradient steps.
 
 Run with:  python smoke_test.py
 No data files needed — uses random token sequences.
+
+PassDelta and RecurrentGPT no longer take qt_levels / delta_qt_levels —
+deltas are now full CastedLinear projections, not QuadTree.
 """
 
 import math
@@ -70,14 +73,15 @@ def test_qt_block():
 # ── 4. PassDelta unit test ────────────────────────────────────────────────────
 def test_pass_delta():
     print("\n[4] PassDelta")
-    delta = PassDelta(dim=64, rank=4, qt_levels=2).to(DEVICE)
+    delta = PassDelta(dim=64, rank=4).to(DEVICE)
     delta.bfloat16()
     restore_low_dim_params_to_fp32(delta)
     x = torch.randn(2, 16, 64, device=DEVICE, dtype=DTYPE)
     out = delta(x)
     assert out.shape == (2, 16, 64)
     out.sum().backward()
-    assert delta.down.qt.vals.grad is not None
+    assert delta.down.weight.grad is not None, "no gradient on down.weight"
+    assert delta.up.weight.grad is not None,   "no gradient on up.weight"
     print("  PASS")
 
 # ── 5. RecurrentGPT forward pass ──────────────────────────────────────────────
@@ -95,9 +99,7 @@ def test_recurrent_gpt_forward():
         logit_softcap=30.0,
         rope_base=10000.0,
         qk_gain_init=1.5,
-        qt_levels=3,
         delta_rank=4,
-        delta_qt_levels=2,
     ).to(DEVICE).bfloat16()
     restore_low_dim_params_to_fp32(model)
 
@@ -126,9 +128,7 @@ def test_loss_decreases():
         logit_softcap=30.0,
         rope_base=10000.0,
         qk_gain_init=1.5,
-        qt_levels=3,
         delta_rank=4,
-        delta_qt_levels=2,
     ).to(DEVICE).bfloat16()
     restore_low_dim_params_to_fp32(model)
 
@@ -170,26 +170,22 @@ def test_param_count():
         logit_softcap=30.0,
         rope_base=10000.0,
         qk_gain_init=1.5,
-        qt_levels=5,
-        delta_rank=4,
-        delta_qt_levels=3,
+        delta_rank=32,
     )
     n = sum(p.numel() for p in model.parameters())
-    # fp32 bytes (as stored in state_dict)
     fp32_bytes = sum(p.numel() * 4 for p in model.parameters())
-    # QuadTree vals are < 65536 → kept as fp16 in int8 pipeline
-    fp16_bytes = sum(
-        p.numel() * 2
-        for name, p in model.named_parameters()
-        if "qt.vals" in name or p.ndim < 2
-    )
-    emb_bytes = model.tok_emb.weight.numel() * 2  # fp16 passthrough
-    print(f"  total params:    {n:,}")
-    print(f"  fp32 footprint:  {fp32_bytes/1024:.1f} KB  ({fp32_bytes/1024/1024:.2f} MB)")
-    print(f"  est. compressed: ~{(fp16_bytes + emb_bytes)/1024:.1f} KB  "
-          f"({(fp16_bytes + emb_bytes)/1024/1024:.2f} MB)")
-    print(f"  budget headroom: {16 - (fp16_bytes+emb_bytes)/1024/1024:.1f} MB "
-          f"(to spend on wider base block)")
+    # Large matrices (>65536 elems) → int8; small tensors → fp16
+    INT8_THRESH = 65_536
+    int8_bytes = sum(p.numel() for name, p in model.named_parameters() if p.numel() > INT8_THRESH)
+    fp16_bytes  = sum(p.numel() * 2 for name, p in model.named_parameters() if p.numel() <= INT8_THRESH)
+    raw_bytes = int8_bytes + fp16_bytes
+    # int6+zstd achieves ~log2(63)/8 ≈ 0.744 compression on int8 payload
+    est_compressed = int(int8_bytes * 0.744 + fp16_bytes)
+    print(f"  total params:      {n:,}")
+    print(f"  fp32 footprint:    {fp32_bytes/1024/1024:.2f} MB")
+    print(f"  raw quant payload: {raw_bytes/1024/1024:.2f} MB  (int8 large + fp16 small)")
+    print(f"  est. int6+zstd:    {est_compressed/1024/1024:.2f} MB")
+    print(f"  budget headroom:   {16 - est_compressed/1024/1024:.1f} MB remaining")
     print("  PASS")
 
 # ── 8. torch.compile smoke ────────────────────────────────────────────────────
@@ -201,7 +197,7 @@ def test_compile():
         vocab_size=256, num_passes=2, model_dim=64, num_heads=4, num_kv_heads=2,
         mlp_mult=2, tie_embeddings=True, tied_embed_init_std=0.005,
         logit_softcap=30.0, rope_base=10000.0, qk_gain_init=1.5,
-        qt_levels=2, delta_rank=4, delta_qt_levels=1,
+        delta_rank=4,
     ).to(DEVICE).bfloat16()
     restore_low_dim_params_to_fp32(model)
     compiled = torch.compile(model, dynamic=False, fullgraph=True)
