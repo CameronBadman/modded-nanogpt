@@ -110,7 +110,7 @@ class Hyperparameters:
     # Number of times the single base block is applied.
     num_recurrent_passes = int(os.environ.get("NUM_RECURRENT_PASSES", "24"))
     # Rank of per-pass low-rank corrector.
-    delta_rank = int(os.environ.get("DELTA_RANK", "8"))
+    delta_rank = int(os.environ.get("DELTA_RANK", "64"))
     # QuadTree depth for delta corrector weights.
     delta_quadtree_levels = int(os.environ.get("DELTA_QUADTREE_LEVELS", "5"))
     # Truncated BPTT: detach hidden state every this many passes (0 = full BPTT).
@@ -966,23 +966,26 @@ class PassDelta(nn.Module):
     """
     Per-recurrence-pass low-rank corrector.
 
-    Implements a tiny bottleneck: x → down → ReLU → up → correction,
-    where both down and up are QuadTreeLinear (coarser grid than the base block).
-    The correction is gated by a learned scalar `delta_scale` (initialised to a
-    small positive value so gradients flow from step 1 while the correction starts
-    near zero).
+    x → RMSNorm → down (dim→rank) → relu² → up (rank→dim, zero-init) → scale
+    Uses full-rank CastedLinear (not QuadTree) so the correction is expressive
+    enough to meaningfully differentiate passes.  The up projection is zero-inited
+    so the correction starts at exactly 0 while still routing gradients through
+    delta_scale from step 1.
     """
 
-    def __init__(self, dim: int, rank: int, qt_levels: int) -> None:
+    def __init__(self, dim: int, rank: int) -> None:
         super().__init__()
-        self.down = QuadTreeLinear(dim, rank, num_levels=qt_levels)
-        # Zero-init up so the initial correction is 0 but gradients can flow.
-        self.up = QuadTreeLinear(rank, dim, num_levels=qt_levels, init_std=0.0)
-        # Start small; learned independently per pass.
+        self.norm = RMSNorm()
+        self.down = CastedLinear(dim, rank, bias=False)
+        self.up   = CastedLinear(rank, dim, bias=False)
+        nn.init.zeros_(self.up.weight)
+        # Learned per-pass amplitude; starts small so training is stable.
         self.delta_scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.delta_scale.to(x.dtype) * self.up(torch.relu(self.down(x)))
+        h = self.down(self.norm(x))
+        h = torch.relu(h).square()          # relu²  (same as base MLP)
+        return self.delta_scale.to(x.dtype) * self.up(h)
 
 
 # -----------------------------
@@ -991,22 +994,16 @@ class PassDelta(nn.Module):
 
 class RecurrentGPT(nn.Module):
     """
-    Single large QTBlock run num_passes times with per-pass PassDelta correctors.
+    Single large Block run num_passes times with per-pass PassDelta correctors
+    and per-pass learned embeddings so the shared block knows which pass it is on.
 
     Architecture:
-        x = embed(input_ids)           # token embedding
-        x0 = rms_norm(x)               # anchor for residual mixing
-        x = x0
+        x  = rms_norm(embed(input_ids))      # normalised token embedding
+        x0 = x                               # base anchor for residual mixing
         for i in range(num_passes):
-            x = base_block(x, x0)      # shared QuadTree block
-            x = x + pass_deltas[i](x)  # tiny per-pass corrector
+            x = base_block(x, x0 + pass_emb[i])   # block sees pass-specific anchor
+            x = x + pass_deltas[i](x)              # expressive per-pass correction
         logits = lm_head(final_norm(x))
-
-    The base block is stored once and re-used num_passes times.  The per-pass
-    correctors are cheap (low rank, coarser QuadTree).  Because only the quadtree
-    scalar values are stored in the state_dict (not the materialized matrices), the
-    compressed model size is a tiny fraction of the 16 MB budget, leaving room to
-    dramatically widen model_dim.
     """
 
     def __init__(
@@ -1023,7 +1020,6 @@ class RecurrentGPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         delta_rank: int,
-        delta_qt_levels: int,
         tbptt_chunk: int = 4,
     ) -> None:
         super().__init__()
@@ -1043,9 +1039,14 @@ class RecurrentGPT(nn.Module):
             depth_scale=1.0 / math.sqrt(num_passes),
         )
         self.pass_deltas = nn.ModuleList([
-            PassDelta(model_dim, delta_rank, delta_qt_levels)
+            PassDelta(model_dim, delta_rank)
             for _ in range(num_passes)
         ])
+        # Per-pass embeddings: tell the shared block which pass it is executing.
+        # Small init so they don't overpower the token signal at the start.
+        self.pass_emb = nn.Embedding(num_passes, model_dim)
+        nn.init.normal_(self.pass_emb.weight, std=0.01)
+
         self.final_norm = RMSNorm()
 
         if tie_embeddings:
@@ -1058,8 +1059,11 @@ class RecurrentGPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
+        pass_offsets = self.pass_emb.weight.to(dtype=x.dtype)  # (P, D)
         for i in range(self.num_passes):
-            x = self.base_block(x, x0)
+            # Inject pass identity into the anchor so the block behaves differently
+            # each pass without needing separate weights.
+            x = self.base_block(x, x0 + pass_offsets[i][None, None, :])
             x = x + self.pass_deltas[i](x)
             if self.tbptt_chunk > 0 and (i + 1) % self.tbptt_chunk == 0 and (i + 1) < self.num_passes:
                 x = x.detach()
@@ -1177,8 +1181,7 @@ def main() -> None:
     if args.use_recurrent:
         log0(
             f"architecture:recurrent_gpt num_passes:{args.num_recurrent_passes} "
-            f"delta_rank:{args.delta_rank} delta_qt_levels:{args.delta_quadtree_levels} "
-            f"tbptt_chunk:{args.tbptt_chunk}"
+            f"delta_rank:{args.delta_rank} pass_emb:yes tbptt_chunk:{args.tbptt_chunk}"
         )
         base_model = RecurrentGPT(
             vocab_size=args.vocab_size,
@@ -1193,26 +1196,30 @@ def main() -> None:
             rope_base=args.rope_base,
             qk_gain_init=args.qk_gain_init,
             delta_rank=args.delta_rank,
-            delta_qt_levels=args.delta_quadtree_levels,
             tbptt_chunk=args.tbptt_chunk,
         ).to(device).bfloat16()
-        # Keep CastedLinear weights in fp32 (same as baseline GPT)
-        for module in base_model.base_block.modules():
+        # Keep CastedLinear weights in fp32 (base_block + pass_delta projections)
+        for module in base_model.modules():
             if isinstance(module, CastedLinear):
                 module.float()
         restore_low_dim_params_to_fp32(base_model)
 
-        # base_block 2D weights → Muon (same as baseline)
-        # pass_deltas QuadTree vals + all scalars/vectors → Adam
+        # base_block 2D weights + PassDelta down/up projections → Muon
+        # (both are linear projections that benefit from orthogonalisation)
         base_block_matrix_params = [
             p for name, p in base_model.base_block.named_parameters()
             if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
         ]
+        delta_matrix_params = [
+            p for name, p in base_model.pass_deltas.named_parameters()
+            if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
+        ]
+        all_matrix_params = base_block_matrix_params + delta_matrix_params
         scalar_params = [
             p for name, p in base_model.named_parameters()
             if "tok_emb" not in name
             and (base_model.lm_head is None or "lm_head" not in name)
-            and id(p) not in {id(q) for q in base_block_matrix_params}
+            and id(p) not in {id(q) for q in all_matrix_params}
         ]
         token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
         optimizer_tok = torch.optim.Adam(
@@ -1224,7 +1231,7 @@ def main() -> None:
             betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
         )
         optimizer_muon = Muon(
-            [{"params": base_block_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
+            [{"params": all_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
             lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps,
         )
         optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_scalar, optimizer_muon]
