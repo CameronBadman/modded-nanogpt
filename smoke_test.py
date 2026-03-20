@@ -217,6 +217,7 @@ def test_recurrent_gpt_shared_cache():
         mlp_style="dense",
         cache_size=8,
         cache_dim=16,
+        cache_topk=2,
     ).to(DEVICE).bfloat16()
     restore_low_dim_params_to_fp32(model)
     with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16, enabled=(DEVICE == "cuda")):

@@ -80,6 +80,7 @@ class Hyperparameters:
     butterfly_topk = int(os.environ.get("BUTTERFLY_TOPK", 2))
     cache_size = int(os.environ.get("CACHE_SIZE", 0))
     cache_dim = int(os.environ.get("CACHE_DIM", 128))
+    cache_topk = int(os.environ.get("CACHE_TOPK", 0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -699,18 +700,21 @@ class MLP(nn.Module):
 class LearnedTokenCache(nn.Module):
     """Shared learned memory bank queried by the token state."""
 
-    def __init__(self, model_dim: int, cache_size: int, cache_dim: int) -> None:
+    def __init__(self, model_dim: int, cache_size: int, cache_dim: int, topk: int = 0) -> None:
         super().__init__()
         if cache_size <= 0:
             raise ValueError(f"cache_size must be positive, got {cache_size}")
         if cache_dim <= 0:
             raise ValueError(f"cache_dim must be positive, got {cache_dim}")
+        if topk < 0 or topk > cache_size:
+            raise ValueError(f"cache_topk must be in [0, cache_size], got {topk} for cache_size={cache_size}")
         self.norm = RMSNorm()
         self.q_proj = CastedLinear(model_dim, cache_dim, bias=False)
         self.out_proj = CastedLinear(cache_dim, model_dim, bias=False)
         self.keys = nn.Parameter(torch.empty(cache_size, cache_dim, dtype=torch.float32))
         self.values = nn.Parameter(torch.empty(cache_size, cache_dim, dtype=torch.float32))
         self.scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+        self.topk = topk
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -724,8 +728,15 @@ class LearnedTokenCache(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         q = self.q_proj(self.norm(x))
         attn = (q @ self.keys.to(q.dtype).T) / math.sqrt(self.keys.size(-1))
-        weights = torch.softmax(attn, dim=-1)
-        retrieved = weights @ self.values.to(q.dtype)
+        values = self.values.to(q.dtype)
+        if self.topk > 0:
+            topk_vals, topk_idx = torch.topk(attn, k=self.topk, dim=-1)
+            weights = torch.softmax(topk_vals, dim=-1)
+            gathered_values = values[topk_idx]
+            retrieved = (weights.unsqueeze(-1) * gathered_values).sum(dim=-2)
+        else:
+            weights = torch.softmax(attn, dim=-1)
+            retrieved = weights @ values
         return self.scale.to(x.dtype) * self.out_proj(retrieved)
 
 
@@ -1271,6 +1282,7 @@ class RecurrentGPT(nn.Module):
         butterfly_topk: int = 2,
         cache_size: int = 0,
         cache_dim: int = 128,
+        cache_topk: int = 0,
         tbptt_chunk: int = 4,
     ) -> None:
         super().__init__()
@@ -1284,7 +1296,7 @@ class RecurrentGPT(nn.Module):
         self.shared_delta: nn.Module | None = None
         self.mlp_style = mlp_style
         self.shared_cache = (
-            LearnedTokenCache(model_dim, cache_size, cache_dim)
+            LearnedTokenCache(model_dim, cache_size, cache_dim, topk=cache_topk)
             if cache_size > 0
             else None
         )
@@ -1461,7 +1473,7 @@ def main() -> None:
         f"delta_mode:{args.delta_mode} delta_rank:{args.delta_rank} "
         f"mlp_style:{args.mlp_style} butterfly_bank_size:{args.butterfly_bank_size} "
         f"butterfly_topk:{args.butterfly_topk} "
-        f"cache_size:{args.cache_size} cache_dim:{args.cache_dim} "
+        f"cache_size:{args.cache_size} cache_dim:{args.cache_dim} cache_topk:{args.cache_topk} "
         f"pass_emb:yes tbptt_chunk:{args.tbptt_chunk}"
     )
     base_model = RecurrentGPT(
@@ -1484,6 +1496,7 @@ def main() -> None:
         butterfly_topk=args.butterfly_topk,
         cache_size=args.cache_size,
         cache_dim=args.cache_dim,
+        cache_topk=args.cache_topk,
         tbptt_chunk=args.tbptt_chunk,
     ).to(device).bfloat16()
     for module in base_model.modules():
