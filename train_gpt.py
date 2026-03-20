@@ -68,6 +68,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape
+    model_family = os.environ.get("MODEL_FAMILY", "recurrent")
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -109,6 +110,8 @@ class Hyperparameters:
     delta_rank = int(os.environ.get("DELTA_RANK", "64"))
     delta_mode = os.environ.get("DELTA_MODE", "per_pass")
     tbptt_chunk = int(os.environ.get("TBPTT_CHUNK", "4"))
+    dynamics_steps = int(os.environ.get("DYNAMICS_STEPS", "8"))
+    dynamics_hidden_mult = int(os.environ.get("DYNAMICS_HIDDEN_MULT", "2"))
 
 
 # -----------------------------
@@ -784,6 +787,113 @@ class LearnedPrototypeBank(nn.Module):
             weights = torch.softmax(logits, dim=-1)
             reconstructed = weights @ prototypes
         return self.scale.to(x.dtype) * self.out_proj(reconstructed)
+
+
+class ShiftTokenMixer(nn.Module):
+    """Cheap local causal mixing by blending current and previous token states."""
+
+    def __init__(self, model_dim: int) -> None:
+        super().__init__()
+        self.proj = CastedLinear(2 * model_dim, model_dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        prev = torch.cat((x[:, :1], x[:, :-1]), dim=1)
+        mixed = torch.cat((x, prev), dim=-1)
+        return self.proj(mixed)
+
+
+class MemoryDynamicsController(nn.Module):
+    """Shared controller for the layerless memory-backed dynamical model."""
+
+    def __init__(
+        self,
+        model_dim: int,
+        hidden_mult: int,
+        memory_size: int,
+        memory_dim: int,
+        memory_topk: int,
+    ) -> None:
+        super().__init__()
+        hidden = hidden_mult * model_dim
+        self.norm = RMSNorm()
+        self.local_mixer = ShiftTokenMixer(model_dim)
+        self.memory = LearnedTokenCache(model_dim, memory_size, memory_dim, topk=memory_topk)
+        self.in_proj = CastedLinear(model_dim, hidden, bias=False)
+        self.out_proj = CastedLinear(hidden, model_dim, bias=False)
+        self.out_proj._zero_init = True
+        self.update_gate = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+
+    def forward(self, state: Tensor) -> Tensor:
+        h = self.norm(state)
+        local = self.local_mixer(h)
+        memory = self.memory(h)
+        update_in = h + local + memory
+        update = self.out_proj(torch.relu(self.in_proj(update_in)).square())
+        return state + self.update_gate.to(state.dtype) * update
+
+
+class MemoryDynamicsLM(nn.Module):
+    """
+    Layerless memory-backed dynamical language model.
+
+    Token states are iteratively refined by a shared controller that combines
+    cheap local token mixing with a learned associative memory read.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        model_dim: int,
+        tie_embeddings: bool,
+        tied_embed_init_std: float,
+        logit_softcap: float,
+        dynamics_steps: int,
+        dynamics_hidden_mult: int,
+        memory_size: int,
+        memory_dim: int,
+        memory_topk: int,
+    ) -> None:
+        super().__init__()
+        if logit_softcap <= 0.0:
+            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if dynamics_steps <= 0:
+            raise ValueError(f"dynamics_steps must be positive, got {dynamics_steps}")
+        self.tie_embeddings = tie_embeddings
+        self.logit_softcap = logit_softcap
+        self.dynamics_steps = dynamics_steps
+
+        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        if tie_embeddings:
+            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=tied_embed_init_std)
+        self.controller = MemoryDynamicsController(
+            model_dim=model_dim,
+            hidden_mult=dynamics_hidden_mult,
+            memory_size=memory_size,
+            memory_dim=memory_dim,
+            memory_topk=memory_topk,
+        )
+        self.final_norm = RMSNorm()
+        self.step_embed = nn.Embedding(dynamics_steps, model_dim)
+        nn.init.normal_(self.step_embed.weight, std=0.01)
+        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+
+    def compute_logits(self, input_ids: Tensor) -> Tensor:
+        state = F.rms_norm(self.tok_emb(input_ids), (self.tok_emb.weight.size(1),))
+        step_offsets = self.step_embed.weight.to(dtype=state.dtype)
+        for i in range(self.dynamics_steps):
+            state = self.controller(state + step_offsets[i][None, None, :])
+        state = self.final_norm(state)
+        if self.tie_embeddings:
+            logits_proj = F.linear(state, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head required when tie_embeddings=False")
+            logits_proj = self.lm_head(state)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        logits = self.compute_logits(input_ids).reshape(-1, self.tok_emb.weight.size(0))
+        return F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="mean")
 
 
 class ButterflyLinear(nn.Module):
@@ -1529,41 +1639,66 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # ------------------------------------------------------------------
 
-    log0(
-        f"architecture:recurrent_gpt num_passes:{args.num_recurrent_passes} "
-        f"delta_mode:{args.delta_mode} delta_rank:{args.delta_rank} "
-        f"mlp_style:{args.mlp_style} butterfly_bank_size:{args.butterfly_bank_size} "
-        f"butterfly_topk:{args.butterfly_topk} "
-        f"cache_size:{args.cache_size} cache_dim:{args.cache_dim} cache_topk:{args.cache_topk} "
-        f"prototype_size:{args.prototype_size} prototype_dim:{args.prototype_dim} prototype_topk:{args.prototype_topk} "
-        f"pass_emb:yes tbptt_chunk:{args.tbptt_chunk}"
-    )
-    base_model = RecurrentGPT(
-        vocab_size=args.vocab_size,
-        num_passes=args.num_recurrent_passes,
-        model_dim=args.model_dim,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings,
-        tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap,
-        rope_base=args.rope_base,
-        qk_gain_init=args.qk_gain_init,
-        delta_rank=args.delta_rank,
-        delta_mode=args.delta_mode,
-        mlp_style=args.mlp_style,
-        butterfly_block_size=args.butterfly_block_size,
-        butterfly_bank_size=args.butterfly_bank_size,
-        butterfly_topk=args.butterfly_topk,
-        cache_size=args.cache_size,
-        cache_dim=args.cache_dim,
-        cache_topk=args.cache_topk,
-        prototype_size=args.prototype_size,
-        prototype_dim=args.prototype_dim,
-        prototype_topk=args.prototype_topk,
-        tbptt_chunk=args.tbptt_chunk,
-    ).to(device).bfloat16()
+    if args.model_family == "recurrent":
+        log0(
+            f"architecture:recurrent_gpt num_passes:{args.num_recurrent_passes} "
+            f"delta_mode:{args.delta_mode} delta_rank:{args.delta_rank} "
+            f"mlp_style:{args.mlp_style} butterfly_bank_size:{args.butterfly_bank_size} "
+            f"butterfly_topk:{args.butterfly_topk} "
+            f"cache_size:{args.cache_size} cache_dim:{args.cache_dim} cache_topk:{args.cache_topk} "
+            f"prototype_size:{args.prototype_size} prototype_dim:{args.prototype_dim} prototype_topk:{args.prototype_topk} "
+            f"pass_emb:yes tbptt_chunk:{args.tbptt_chunk}"
+        )
+        base_model = RecurrentGPT(
+            vocab_size=args.vocab_size,
+            num_passes=args.num_recurrent_passes,
+            model_dim=args.model_dim,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings,
+            tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap,
+            rope_base=args.rope_base,
+            qk_gain_init=args.qk_gain_init,
+            delta_rank=args.delta_rank,
+            delta_mode=args.delta_mode,
+            mlp_style=args.mlp_style,
+            butterfly_block_size=args.butterfly_block_size,
+            butterfly_bank_size=args.butterfly_bank_size,
+            butterfly_topk=args.butterfly_topk,
+            cache_size=args.cache_size,
+            cache_dim=args.cache_dim,
+            cache_topk=args.cache_topk,
+            prototype_size=args.prototype_size,
+            prototype_dim=args.prototype_dim,
+            prototype_topk=args.prototype_topk,
+            tbptt_chunk=args.tbptt_chunk,
+        ).to(device).bfloat16()
+    elif args.model_family == "dynamics":
+        memory_size = args.cache_size if args.cache_size > 0 else args.prototype_size
+        memory_dim = args.cache_dim if args.cache_size > 0 else args.prototype_dim
+        memory_topk = args.cache_topk if args.cache_size > 0 else args.prototype_topk
+        if memory_size <= 0:
+            raise ValueError("MODEL_FAMILY=dynamics requires CACHE_SIZE>0 or PROTOTYPE_SIZE>0")
+        log0(
+            f"architecture:memory_dynamics steps:{args.dynamics_steps} hidden_mult:{args.dynamics_hidden_mult} "
+            f"memory_size:{memory_size} memory_dim:{memory_dim} memory_topk:{memory_topk}"
+        )
+        base_model = MemoryDynamicsLM(
+            vocab_size=args.vocab_size,
+            model_dim=args.model_dim,
+            tie_embeddings=args.tie_embeddings,
+            tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap,
+            dynamics_steps=args.dynamics_steps,
+            dynamics_hidden_mult=args.dynamics_hidden_mult,
+            memory_size=memory_size,
+            memory_dim=memory_dim,
+            memory_topk=memory_topk,
+        ).to(device).bfloat16()
+    else:
+        raise ValueError(f"Unsupported MODEL_FAMILY={args.model_family!r}")
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()

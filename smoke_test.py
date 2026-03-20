@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from train_gpt import (
+    MemoryDynamicsLM,
     QuadTreeTensor,
     QuadTreeLinear,
     QTBlock,
@@ -255,6 +256,29 @@ def test_recurrent_gpt_shared_prototype():
     assert loss.isfinite(), "shared prototype bank produced non-finite loss"
     print("  PASS")
 
+
+def test_memory_dynamics_lm():
+    print("\n[5g] MemoryDynamicsLM")
+    x = torch.randint(0, 256, (2, 16), device=DEVICE)
+    y = torch.randint(0, 256, (2, 16), device=DEVICE)
+    model = MemoryDynamicsLM(
+        vocab_size=256,
+        model_dim=64,
+        tie_embeddings=True,
+        tied_embed_init_std=0.005,
+        logit_softcap=30.0,
+        dynamics_steps=3,
+        dynamics_hidden_mult=2,
+        memory_size=8,
+        memory_dim=16,
+        memory_topk=2,
+    ).to(DEVICE).bfloat16()
+    restore_low_dim_params_to_fp32(model)
+    with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16, enabled=(DEVICE == "cuda")):
+        loss = model(x, y)
+    assert loss.isfinite(), "memory dynamics model produced non-finite loss"
+    print("  PASS")
+
 # ── 6. RecurrentGPT loss decreases ───────────────────────────────────────────
 def test_loss_decreases():
     print("\n[6] RecurrentGPT — loss decreases over 30 steps")
@@ -365,6 +389,7 @@ if __name__ == "__main__":
     test_recurrent_gpt_butterfly_bank_mlp()
     test_recurrent_gpt_shared_cache()
     test_recurrent_gpt_shared_prototype()
+    test_memory_dynamics_lm()
     test_loss_decreases()
     test_param_count()
     test_compile()
