@@ -49,4 +49,20 @@ python train_gpt.py
 - `CONTEXT_NGRAM=2, 3, 4`
 - `CONTEXT_MIX_INIT=0.05, 0.1, 0.2`
 
+## Multi-stream context codes
+
+The trainer also supports multiple parallel context-code streams via:
+
+- `CONTEXT_CODEBOOK_SIZES`
+- `CONTEXT_NGRAMS`
+- `CONTEXT_MIX_INITS`
+
+Example:
+
+```bash
+CONTEXT_CODEBOOK_SIZES=4096,4096 \
+CONTEXT_NGRAMS=2,4 \
+CONTEXT_MIX_INITS=0.08,0.08
+```
+
 The clean comparison baseline is the same config with `CONTEXT_CODEBOOK_SIZE=0`.

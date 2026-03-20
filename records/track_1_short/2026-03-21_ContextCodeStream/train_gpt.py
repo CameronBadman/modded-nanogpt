@@ -43,6 +43,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # HYPERPARAMETERS
 # -----------------------------
 
+
+def _parse_int_csv(value: str) -> list[int]:
+    return [int(x.strip()) for x in value.split(",") if x.strip()]
+
+
+def _parse_float_csv(value: str) -> list[float]:
+    return [float(x.strip()) for x in value.split(",") if x.strip()]
+
 class Hyperparameters:
     # Data paths
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -88,6 +96,9 @@ class Hyperparameters:
     context_codebook_size = int(os.environ.get("CONTEXT_CODEBOOK_SIZE", 0))
     context_ngram = int(os.environ.get("CONTEXT_NGRAM", 3))
     context_mix_init = float(os.environ.get("CONTEXT_MIX_INIT", 0.1))
+    context_codebook_sizes = _parse_int_csv(os.environ.get("CONTEXT_CODEBOOK_SIZES", ""))
+    context_ngrams = _parse_int_csv(os.environ.get("CONTEXT_NGRAMS", ""))
+    context_mix_inits = _parse_float_csv(os.environ.get("CONTEXT_MIX_INITS", ""))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -828,6 +839,44 @@ class LocalContextCodebook(nn.Module):
         return self.mix * self.emb(codes)
 
 
+class MultiContextCodebook(nn.Module):
+    """Sum of multiple causal hashed context-code streams."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        model_dim: int,
+        codebook_sizes: list[int],
+        ngrams: list[int],
+        mix_inits: list[float],
+    ) -> None:
+        super().__init__()
+        if not codebook_sizes:
+            raise ValueError("context codebook stream list must be non-empty")
+        if len(ngrams) != len(codebook_sizes):
+            raise ValueError("CONTEXT_NGRAMS must match CONTEXT_CODEBOOK_SIZES length")
+        if len(mix_inits) != len(codebook_sizes):
+            raise ValueError("CONTEXT_MIX_INITS must match CONTEXT_CODEBOOK_SIZES length")
+        self.streams = nn.ModuleList(
+            [
+                LocalContextCodebook(
+                    vocab_size=vocab_size,
+                    model_dim=model_dim,
+                    codebook_size=size,
+                    ngram=ngram,
+                    mix_init=mix_init,
+                )
+                for size, ngram, mix_init in zip(codebook_sizes, ngrams, mix_inits, strict=True)
+            ]
+        )
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        out = self.streams[0](input_ids)
+        for stream in self.streams[1:]:
+            out = out + stream(input_ids)
+        return out
+
+
 class ShiftTokenMixer(nn.Module):
     """Cheap local causal mixing by blending current and previous token states."""
 
@@ -1490,6 +1539,9 @@ class RecurrentGPT(nn.Module):
         context_codebook_size: int = 0,
         context_ngram: int = 3,
         context_mix_init: float = 0.1,
+        context_codebook_sizes: list[int] | None = None,
+        context_ngrams: list[int] | None = None,
+        context_mix_inits: list[float] | None = None,
         tbptt_chunk: int = 4,
     ) -> None:
         super().__init__()
@@ -1512,15 +1564,25 @@ class RecurrentGPT(nn.Module):
             if prototype_size > 0
             else None
         )
+        if context_codebook_sizes is None:
+            context_codebook_sizes = []
+        if context_ngrams is None:
+            context_ngrams = []
+        if context_mix_inits is None:
+            context_mix_inits = []
+        if not context_codebook_sizes and context_codebook_size > 0:
+            context_codebook_sizes = [context_codebook_size]
+            context_ngrams = [context_ngram]
+            context_mix_inits = [context_mix_init]
         self.context_codebook = (
-            LocalContextCodebook(
+            MultiContextCodebook(
                 vocab_size=vocab_size,
                 model_dim=model_dim,
-                codebook_size=context_codebook_size,
-                ngram=context_ngram,
-                mix_init=context_mix_init,
+                codebook_sizes=context_codebook_sizes,
+                ngrams=context_ngrams,
+                mix_inits=context_mix_inits,
             )
-            if context_codebook_size > 0
+            if context_codebook_sizes
             else None
         )
 
@@ -1704,6 +1766,8 @@ def main() -> None:
             f"prototype_size:{args.prototype_size} prototype_dim:{args.prototype_dim} prototype_topk:{args.prototype_topk} "
             f"context_codebook_size:{args.context_codebook_size} context_ngram:{args.context_ngram} "
             f"context_mix_init:{args.context_mix_init} "
+            f"context_codebook_sizes:{args.context_codebook_sizes} "
+            f"context_ngrams:{args.context_ngrams} context_mix_inits:{args.context_mix_inits} "
             f"pass_emb:yes tbptt_chunk:{args.tbptt_chunk}"
         )
         base_model = RecurrentGPT(
@@ -1733,6 +1797,9 @@ def main() -> None:
             context_codebook_size=args.context_codebook_size,
             context_ngram=args.context_ngram,
             context_mix_init=args.context_mix_init,
+            context_codebook_sizes=args.context_codebook_sizes,
+            context_ngrams=args.context_ngrams,
+            context_mix_inits=args.context_mix_inits,
             tbptt_chunk=args.tbptt_chunk,
         ).to(device).bfloat16()
     elif args.model_family == "dynamics":
