@@ -78,6 +78,8 @@ class Hyperparameters:
     butterfly_block_size = int(os.environ.get("BUTTERFLY_BLOCK_SIZE", 64))
     butterfly_bank_size = int(os.environ.get("BUTTERFLY_BANK_SIZE", 4))
     butterfly_topk = int(os.environ.get("BUTTERFLY_TOPK", 2))
+    cache_size = int(os.environ.get("CACHE_SIZE", 0))
+    cache_dim = int(os.environ.get("CACHE_DIM", 128))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -694,6 +696,39 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class LearnedTokenCache(nn.Module):
+    """Shared learned memory bank queried by the token state."""
+
+    def __init__(self, model_dim: int, cache_size: int, cache_dim: int) -> None:
+        super().__init__()
+        if cache_size <= 0:
+            raise ValueError(f"cache_size must be positive, got {cache_size}")
+        if cache_dim <= 0:
+            raise ValueError(f"cache_dim must be positive, got {cache_dim}")
+        self.norm = RMSNorm()
+        self.q_proj = CastedLinear(model_dim, cache_dim, bias=False)
+        self.out_proj = CastedLinear(cache_dim, model_dim, bias=False)
+        self.keys = nn.Parameter(torch.empty(cache_size, cache_dim, dtype=torch.float32))
+        self.values = nn.Parameter(torch.empty(cache_size, cache_dim, dtype=torch.float32))
+        self.scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        bound = 1.0 / math.sqrt(self.keys.size(-1))
+        with torch.no_grad():
+            self.keys.uniform_(-bound, bound)
+            self.values.uniform_(-bound, bound)
+        nn.init.normal_(self.q_proj.weight, mean=0.0, std=1.0 / math.sqrt(self.q_proj.in_features))
+        nn.init.normal_(self.out_proj.weight, mean=0.0, std=1.0 / math.sqrt(self.out_proj.in_features))
+
+    def forward(self, x: Tensor) -> Tensor:
+        q = self.q_proj(self.norm(x))
+        attn = (q @ self.keys.to(q.dtype).T) / math.sqrt(self.keys.size(-1))
+        weights = torch.softmax(attn, dim=-1)
+        retrieved = weights @ self.values.to(q.dtype)
+        return self.scale.to(x.dtype) * self.out_proj(retrieved)
+
+
 class ButterflyLinear(nn.Module):
     """
     Butterfly-inspired linear map using two block-diagonal mixing stages with a
@@ -884,6 +919,7 @@ class Block(nn.Module):
         butterfly_block_size: int = 64,
         butterfly_bank_size: int = 4,
         butterfly_topk: int = 2,
+        shared_cache: nn.Module | None = None,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -897,8 +933,10 @@ class Block(nn.Module):
             self.mlp = ButterflyBankMLP(dim, mlp_mult, butterfly_block_size, butterfly_bank_size, butterfly_topk)
         else:
             raise ValueError(f"Unsupported MLP_STYLE={mlp_style!r}")
+        self.shared_cache = shared_cache
         self.attn_scale = nn.Parameter(torch.full((dim,), depth_scale, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.full((dim,), depth_scale, dtype=torch.float32))
+        self.cache_scale = nn.Parameter(torch.full((dim,), depth_scale, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
@@ -906,6 +944,9 @@ class Block(nn.Module):
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        if self.shared_cache is not None:
+            cache_out = self.shared_cache(x)
+            x = x + self.cache_scale.to(dtype=x.dtype)[None, None, :] * cache_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -1228,6 +1269,8 @@ class RecurrentGPT(nn.Module):
         butterfly_block_size: int = 64,
         butterfly_bank_size: int = 4,
         butterfly_topk: int = 2,
+        cache_size: int = 0,
+        cache_dim: int = 128,
         tbptt_chunk: int = 4,
     ) -> None:
         super().__init__()
@@ -1240,6 +1283,11 @@ class RecurrentGPT(nn.Module):
         self.delta_mode = delta_mode
         self.shared_delta: nn.Module | None = None
         self.mlp_style = mlp_style
+        self.shared_cache = (
+            LearnedTokenCache(model_dim, cache_size, cache_dim)
+            if cache_size > 0
+            else None
+        )
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         if tie_embeddings:
@@ -1252,6 +1300,7 @@ class RecurrentGPT(nn.Module):
             butterfly_block_size=butterfly_block_size,
             butterfly_bank_size=butterfly_bank_size,
             butterfly_topk=butterfly_topk,
+            shared_cache=self.shared_cache,
         )
         self.pass_deltas = nn.ModuleList(self._build_pass_deltas(model_dim, delta_rank))
         # Per-pass embeddings: tell the shared block which pass it is executing.
@@ -1412,6 +1461,7 @@ def main() -> None:
         f"delta_mode:{args.delta_mode} delta_rank:{args.delta_rank} "
         f"mlp_style:{args.mlp_style} butterfly_bank_size:{args.butterfly_bank_size} "
         f"butterfly_topk:{args.butterfly_topk} "
+        f"cache_size:{args.cache_size} cache_dim:{args.cache_dim} "
         f"pass_emb:yes tbptt_chunk:{args.tbptt_chunk}"
     )
     base_model = RecurrentGPT(
@@ -1432,6 +1482,8 @@ def main() -> None:
         butterfly_block_size=args.butterfly_block_size,
         butterfly_bank_size=args.butterfly_bank_size,
         butterfly_topk=args.butterfly_topk,
+        cache_size=args.cache_size,
+        cache_dim=args.cache_dim,
         tbptt_chunk=args.tbptt_chunk,
     ).to(device).bfloat16()
     for module in base_model.modules():
