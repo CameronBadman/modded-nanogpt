@@ -263,7 +263,7 @@ def eval_val(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
-    with torch.inference_mode():
+    with torch.no_grad():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
             raw_start = batch_seq_start * args.train_seq_len
@@ -334,7 +334,7 @@ def eval_val_sliding(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     base_model.eval()
-    with torch.inference_mode():
+    with torch.no_grad():
         for bi in range(0, len(rank_windows), batch_size):
             ws = rank_windows[bi : bi + batch_size]
 
