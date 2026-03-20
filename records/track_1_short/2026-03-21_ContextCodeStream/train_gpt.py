@@ -99,6 +99,9 @@ class Hyperparameters:
     context_codebook_sizes = _parse_int_csv(os.environ.get("CONTEXT_CODEBOOK_SIZES", ""))
     context_ngrams = _parse_int_csv(os.environ.get("CONTEXT_NGRAMS", ""))
     context_mix_inits = _parse_float_csv(os.environ.get("CONTEXT_MIX_INITS", ""))
+    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 0))
+    bigram_hash_mix_init = float(os.environ.get("BIGRAM_HASH_MIX_INIT", 0.1))
+    mtp_tokens = int(os.environ.get("MTP_TOKENS", 1))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -877,6 +880,28 @@ class MultiContextCodebook(nn.Module):
         return out
 
 
+class BigramHashEmbedding(nn.Module):
+    """Cheap hashed bigram embedding stream from previous/current token ids."""
+
+    def __init__(self, vocab_size: int, model_dim: int, buckets: int, mix_init: float) -> None:
+        super().__init__()
+        if buckets <= 0:
+            raise ValueError(f"bigram_hash_buckets must be positive, got {buckets}")
+        self.vocab_size = vocab_size
+        self.buckets = buckets
+        self.emb = nn.Embedding(buckets, model_dim)
+        self.mix = nn.Parameter(torch.tensor(mix_init, dtype=torch.float32))
+        nn.init.normal_(self.emb.weight, mean=0.0, std=1.0 / math.sqrt(model_dim))
+
+    def buckets_for(self, input_ids: Tensor) -> Tensor:
+        prev = torch.cat((input_ids[:, :1], input_ids[:, :-1]), dim=1).to(torch.int64)
+        curr = input_ids.to(torch.int64)
+        return (prev * 1_000_003 + curr * 97 + 17) % self.buckets
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        return self.mix * self.emb(self.buckets_for(input_ids))
+
+
 class ShiftTokenMixer(nn.Module):
     """Cheap local causal mixing by blending current and previous token states."""
 
@@ -1542,6 +1567,9 @@ class RecurrentGPT(nn.Module):
         context_codebook_sizes: list[int] | None = None,
         context_ngrams: list[int] | None = None,
         context_mix_inits: list[float] | None = None,
+        bigram_hash_buckets: int = 0,
+        bigram_hash_mix_init: float = 0.1,
+        mtp_tokens: int = 1,
         tbptt_chunk: int = 4,
     ) -> None:
         super().__init__()
@@ -1552,6 +1580,7 @@ class RecurrentGPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
         self.delta_mode = delta_mode
+        self.mtp_tokens = mtp_tokens
         self.shared_delta: nn.Module | None = None
         self.mlp_style = mlp_style
         self.shared_cache = (
@@ -1583,6 +1612,16 @@ class RecurrentGPT(nn.Module):
                 mix_inits=context_mix_inits,
             )
             if context_codebook_sizes
+            else None
+        )
+        self.bigram_hash = (
+            BigramHashEmbedding(
+                vocab_size=vocab_size,
+                model_dim=model_dim,
+                buckets=bigram_hash_buckets,
+                mix_init=bigram_hash_mix_init,
+            )
+            if bigram_hash_buckets > 0
             else None
         )
 
@@ -1635,6 +1674,8 @@ class RecurrentGPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.context_codebook is not None:
             x = x + self.context_codebook(input_ids).to(dtype=x.dtype)
+        if self.bigram_hash is not None:
+            x = x + self.bigram_hash(input_ids).to(dtype=x.dtype)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         pass_offsets = self.pass_emb.weight.to(dtype=x.dtype)  # (P, D)
@@ -1655,8 +1696,25 @@ class RecurrentGPT(nn.Module):
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        logits = self.compute_logits(input_ids).reshape(-1, self.tok_emb.weight.size(0))
-        return F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="mean")
+        logits = self.compute_logits(input_ids)
+        losses = [
+            F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                target_ids.reshape(-1),
+                reduction="mean",
+            )
+        ]
+        for offset in range(1, self.mtp_tokens):
+            if input_ids.size(1) <= offset:
+                break
+            losses.append(
+                F.cross_entropy(
+                    logits[:, :-offset, :].reshape(-1, logits.size(-1)).float(),
+                    target_ids[:, offset:].reshape(-1),
+                    reduction="mean",
+                )
+            )
+        return torch.stack(losses).mean()
 
 
 # -----------------------------
@@ -1768,6 +1826,8 @@ def main() -> None:
             f"context_mix_init:{args.context_mix_init} "
             f"context_codebook_sizes:{args.context_codebook_sizes} "
             f"context_ngrams:{args.context_ngrams} context_mix_inits:{args.context_mix_inits} "
+            f"bigram_hash_buckets:{args.bigram_hash_buckets} bigram_hash_mix_init:{args.bigram_hash_mix_init} "
+            f"mtp_tokens:{args.mtp_tokens} "
             f"pass_emb:yes tbptt_chunk:{args.tbptt_chunk}"
         )
         base_model = RecurrentGPT(
@@ -1800,6 +1860,9 @@ def main() -> None:
             context_codebook_sizes=args.context_codebook_sizes,
             context_ngrams=args.context_ngrams,
             context_mix_inits=args.context_mix_inits,
+            bigram_hash_buckets=args.bigram_hash_buckets,
+            bigram_hash_mix_init=args.bigram_hash_mix_init,
+            mtp_tokens=args.mtp_tokens,
             tbptt_chunk=args.tbptt_chunk,
         ).to(device).bfloat16()
     elif args.model_family == "dynamics":

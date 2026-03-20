@@ -65,4 +65,20 @@ CONTEXT_NGRAMS=2,4 \
 CONTEXT_MIX_INITS=0.08,0.08
 ```
 
+## Bigram hash + MTP
+
+The trainer also supports:
+
+- `BIGRAM_HASH_BUCKETS`
+- `BIGRAM_HASH_MIX_INIT`
+- `MTP_TOKENS`
+
+Example:
+
+```bash
+BIGRAM_HASH_BUCKETS=2048 \
+BIGRAM_HASH_MIX_INIT=0.08 \
+MTP_TOKENS=2
+```
+
 The clean comparison baseline is the same config with `CONTEXT_CODEBOOK_SIZE=0`.
