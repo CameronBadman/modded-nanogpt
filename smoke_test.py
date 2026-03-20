@@ -166,6 +166,35 @@ def test_recurrent_gpt_butterfly_mlp():
     assert loss.isfinite(), "butterfly MLP produced non-finite loss"
     print("  PASS")
 
+
+def test_recurrent_gpt_butterfly_bank_mlp():
+    print("\n[5d] RecurrentGPT — butterfly bank MLP")
+    x = torch.randint(0, 256, (2, 16), device=DEVICE)
+    y = torch.randint(0, 256, (2, 16), device=DEVICE)
+    model = RecurrentGPT(
+        vocab_size=256,
+        num_passes=2,
+        model_dim=64,
+        num_heads=4,
+        num_kv_heads=2,
+        mlp_mult=2,
+        tie_embeddings=True,
+        tied_embed_init_std=0.005,
+        logit_softcap=30.0,
+        rope_base=10000.0,
+        qk_gain_init=1.5,
+        delta_rank=4,
+        delta_mode="shared",
+        mlp_style="butterfly_bank",
+        butterfly_block_size=16,
+        butterfly_bank_size=3,
+    ).to(DEVICE).bfloat16()
+    restore_low_dim_params_to_fp32(model)
+    with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16, enabled=(DEVICE == "cuda")):
+        loss = model(x, y)
+    assert loss.isfinite(), "butterfly bank MLP produced non-finite loss"
+    print("  PASS")
+
 # ── 6. RecurrentGPT loss decreases ───────────────────────────────────────────
 def test_loss_decreases():
     print("\n[6] RecurrentGPT — loss decreases over 30 steps")
@@ -273,6 +302,7 @@ if __name__ == "__main__":
     test_recurrent_gpt_forward()
     test_recurrent_gpt_delta_modes()
     test_recurrent_gpt_butterfly_mlp()
+    test_recurrent_gpt_butterfly_bank_mlp()
     test_loss_decreases()
     test_param_count()
     test_compile()
