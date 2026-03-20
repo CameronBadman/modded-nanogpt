@@ -77,6 +77,7 @@ class Hyperparameters:
     mlp_style = os.environ.get("MLP_STYLE", "dense")
     butterfly_block_size = int(os.environ.get("BUTTERFLY_BLOCK_SIZE", 64))
     butterfly_bank_size = int(os.environ.get("BUTTERFLY_BANK_SIZE", 4))
+    butterfly_topk = int(os.environ.get("BUTTERFLY_TOPK", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -754,10 +755,20 @@ class ButterflyBankLinear(nn.Module):
     routing diversity than a single fixed butterfly.
     """
 
-    def __init__(self, in_features: int, out_features: int, block_size: int, bank_size: int, bias: bool = False) -> None:
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        block_size: int,
+        bank_size: int,
+        topk: int,
+        bias: bool = False,
+    ) -> None:
         super().__init__()
         if bank_size <= 0:
             raise ValueError(f"bank_size must be positive, got {bank_size}")
+        if topk <= 0 or topk > bank_size:
+            raise ValueError(f"topk must be in [1, bank_size], got topk={topk}, bank_size={bank_size}")
         if in_features % block_size != 0:
             raise ValueError(f"in_features={in_features} must be divisible by block_size={block_size}")
         if out_features % block_size != 0:
@@ -766,6 +777,7 @@ class ButterflyBankLinear(nn.Module):
         self.out_features = out_features
         self.block_size = block_size
         self.bank_size = bank_size
+        self.topk = topk
         self.n_in_blocks = in_features // block_size
         self.n_out_blocks = out_features // block_size
 
@@ -822,10 +834,11 @@ class ButterflyBankLinear(nn.Module):
         return x
 
     def forward(self, x: Tensor) -> Tensor:
-        coeffs = torch.softmax(self.mix_logits, dim=0).to(dtype=x.dtype)
-        out = self._member_forward(x, 0) * coeffs[0]
-        for idx in range(1, self.bank_size):
-            out = out + self._member_forward(x, idx) * coeffs[idx]
+        topk_vals, topk_idx = torch.topk(self.mix_logits, k=self.topk)
+        coeffs = torch.softmax(topk_vals, dim=0).to(dtype=x.dtype)
+        out = self._member_forward(x, int(topk_idx[0].item())) * coeffs[0]
+        for coeff, idx in zip(coeffs[1:], topk_idx[1:], strict=False):
+            out = out + self._member_forward(x, int(idx.item())) * coeff
         return out
 
 
@@ -846,11 +859,11 @@ class ButterflyMLP(nn.Module):
 class ButterflyBankMLP(nn.Module):
     """relu^2 MLP whose projections are mixed from a butterfly operator bank."""
 
-    def __init__(self, dim: int, mlp_mult: int, block_size: int, bank_size: int):
+    def __init__(self, dim: int, mlp_mult: int, block_size: int, bank_size: int, topk: int):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = ButterflyBankLinear(dim, hidden, block_size=block_size, bank_size=bank_size, bias=False)
-        self.proj = ButterflyBankLinear(hidden, dim, block_size=block_size, bank_size=bank_size, bias=False)
+        self.fc = ButterflyBankLinear(dim, hidden, block_size=block_size, bank_size=bank_size, topk=topk, bias=False)
+        self.proj = ButterflyBankLinear(hidden, dim, block_size=block_size, bank_size=bank_size, topk=topk, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
@@ -870,6 +883,7 @@ class Block(nn.Module):
         mlp_style: str = "dense",
         butterfly_block_size: int = 64,
         butterfly_bank_size: int = 4,
+        butterfly_topk: int = 2,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -880,7 +894,7 @@ class Block(nn.Module):
         elif mlp_style == "butterfly":
             self.mlp = ButterflyMLP(dim, mlp_mult, butterfly_block_size)
         elif mlp_style == "butterfly_bank":
-            self.mlp = ButterflyBankMLP(dim, mlp_mult, butterfly_block_size, butterfly_bank_size)
+            self.mlp = ButterflyBankMLP(dim, mlp_mult, butterfly_block_size, butterfly_bank_size, butterfly_topk)
         else:
             raise ValueError(f"Unsupported MLP_STYLE={mlp_style!r}")
         self.attn_scale = nn.Parameter(torch.full((dim,), depth_scale, dtype=torch.float32))
@@ -1213,6 +1227,7 @@ class RecurrentGPT(nn.Module):
         mlp_style: str = "dense",
         butterfly_block_size: int = 64,
         butterfly_bank_size: int = 4,
+        butterfly_topk: int = 2,
         tbptt_chunk: int = 4,
     ) -> None:
         super().__init__()
@@ -1236,6 +1251,7 @@ class RecurrentGPT(nn.Module):
             mlp_style=mlp_style,
             butterfly_block_size=butterfly_block_size,
             butterfly_bank_size=butterfly_bank_size,
+            butterfly_topk=butterfly_topk,
         )
         self.pass_deltas = nn.ModuleList(self._build_pass_deltas(model_dim, delta_rank))
         # Per-pass embeddings: tell the shared block which pass it is executing.
@@ -1395,6 +1411,7 @@ def main() -> None:
         f"architecture:recurrent_gpt num_passes:{args.num_recurrent_passes} "
         f"delta_mode:{args.delta_mode} delta_rank:{args.delta_rank} "
         f"mlp_style:{args.mlp_style} butterfly_bank_size:{args.butterfly_bank_size} "
+        f"butterfly_topk:{args.butterfly_topk} "
         f"pass_emb:yes tbptt_chunk:{args.tbptt_chunk}"
     )
     base_model = RecurrentGPT(
@@ -1414,6 +1431,7 @@ def main() -> None:
         mlp_style=args.mlp_style,
         butterfly_block_size=args.butterfly_block_size,
         butterfly_bank_size=args.butterfly_bank_size,
+        butterfly_topk=args.butterfly_topk,
         tbptt_chunk=args.tbptt_chunk,
     ).to(device).bfloat16()
     for module in base_model.modules():
