@@ -99,6 +99,10 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    embed_weight_decay = float(os.environ.get("EMBED_WEIGHT_DECAY", 0.0))
+    head_weight_decay = float(os.environ.get("HEAD_WEIGHT_DECAY", 0.0))
+    scalar_weight_decay = float(os.environ.get("SCALAR_WEIGHT_DECAY", 0.0))
+    matrix_weight_decay = float(os.environ.get("MATRIX_WEIGHT_DECAY", 0.0))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -107,6 +111,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    swa_snapshots = int(os.environ.get("SWA_SNAPSHOTS", 0))
 
     # Recurrent architecture
     num_recurrent_passes = int(os.environ.get("NUM_RECURRENT_PASSES", "24"))
@@ -623,6 +628,32 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
+
+
+def apply_weight_decay_(params: list[Tensor], weight_decay: float) -> None:
+    if weight_decay <= 0.0:
+        return
+    with torch.no_grad():
+        for p in params:
+            p.mul_(1.0 - weight_decay)
+
+
+def update_swa_state(
+    swa_state: dict[str, Tensor] | None,
+    model: nn.Module,
+    count: int,
+) -> tuple[dict[str, Tensor] | None, int]:
+    if swa_state is None:
+        swa_state = {
+            name: tensor.detach().float().cpu().clone()
+            for name, tensor in model.state_dict().items()
+        }
+        return swa_state, 1
+    new_count = count + 1
+    mix = 1.0 / new_count
+    for name, tensor in model.state_dict().items():
+        swa_state[name].lerp_(tensor.detach().float().cpu(), mix)
+    return swa_state, new_count
 
 
 class Rotary(nn.Module):
@@ -1816,6 +1847,11 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
+        f"weight_decay embed:{args.embed_weight_decay} head:{args.head_weight_decay} "
+        f"matrix:{args.matrix_weight_decay} scalar:{args.scalar_weight_decay} "
+        f"swa_snapshots:{args.swa_snapshots}"
+    )
+    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
@@ -1882,6 +1918,10 @@ def main() -> None:
     stop_after_step: int | None = None
     timing_totals = dict(data=0.0, forward_backward=0.0, optimizer=0.0, validation=0.0)
     validation_calls = 0
+    swa_state: dict[str, Tensor] | None = None
+    swa_count = 0
+    swa_start = max(args.iterations - args.warmdown_iters, 0)
+    swa_interval = max(args.warmdown_iters // max(args.swa_snapshots, 1), 1) if args.swa_snapshots > 0 else 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1960,12 +2000,19 @@ def main() -> None:
         t_opt_start = time.perf_counter()
         for opt in optimizers:
             opt.step()
+        apply_weight_decay_([base_model.tok_emb.weight], args.embed_weight_decay)
+        if base_model.lm_head is not None:
+            apply_weight_decay_(list(base_model.lm_head.parameters()), args.head_weight_decay)
+        apply_weight_decay_(scalar_params, args.scalar_weight_decay)
+        apply_weight_decay_(matrix_params, args.matrix_weight_decay)
         torch.cuda.synchronize()
         step_optimizer_ms = 1000.0 * (time.perf_counter() - t_opt_start)
         timing_totals["optimizer"] += step_optimizer_ms
         zero_grad_all()
 
         step += 1
+        if args.swa_snapshots > 0 and step >= swa_start and (step - swa_start) % swa_interval == 0:
+            swa_state, swa_count = update_swa_state(swa_state, base_model, swa_count)
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1992,6 +2039,9 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if swa_state is not None and swa_count > 0:
+        base_model.load_state_dict(swa_state, strict=True)
+        log0(f"swa_applied snapshots:{swa_count}")
     if step > 0:
         log0(
             "timing_breakdown_avg "
