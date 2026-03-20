@@ -6,12 +6,11 @@ decreases over a few gradient steps.
 Run with:  python smoke_test.py
 No data files needed — uses random token sequences.
 
-PassDelta and RecurrentGPT no longer take qt_levels / delta_qt_levels —
-deltas are now full CastedLinear projections, not QuadTree.
+PassDelta and RecurrentGPT no longer take qt_levels / delta_qt_levels.
+RecurrentGPT now supports delta ablations via delta_mode.
 """
 
 import math
-import pytest
 import torch
 import torch.nn.functional as F
 
@@ -112,6 +111,33 @@ def test_recurrent_gpt_forward():
     print(f"  initial loss={loss.item():.4f}  PASS")
     return model
 
+
+def test_recurrent_gpt_delta_modes():
+    print("\n[5b] RecurrentGPT — delta modes")
+    x = torch.randint(0, 256, (2, 16), device=DEVICE)
+    y = torch.randint(0, 256, (2, 16), device=DEVICE)
+    for delta_mode in ("per_pass", "shared", "scalar", "none"):
+        model = RecurrentGPT(
+            vocab_size=256,
+            num_passes=3,
+            model_dim=64,
+            num_heads=4,
+            num_kv_heads=2,
+            mlp_mult=2,
+            tie_embeddings=True,
+            tied_embed_init_std=0.005,
+            logit_softcap=30.0,
+            rope_base=10000.0,
+            qk_gain_init=1.5,
+            delta_rank=4,
+            delta_mode=delta_mode,
+        ).to(DEVICE).bfloat16()
+        restore_low_dim_params_to_fp32(model)
+        with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16, enabled=(DEVICE == "cuda")):
+            loss = model(x, y)
+        assert loss.isfinite(), f"{delta_mode=} produced non-finite loss"
+    print("  PASS")
+
 # ── 6. RecurrentGPT loss decreases ───────────────────────────────────────────
 def test_loss_decreases():
     print("\n[6] RecurrentGPT — loss decreases over 30 steps")
@@ -191,7 +217,8 @@ def test_param_count():
 # ── 8. torch.compile smoke ────────────────────────────────────────────────────
 def test_compile():
     if DEVICE != "cuda":
-        pytest.skip("no CUDA")
+        print("\n[8] torch.compile  SKIP (no CUDA)")
+        return
     print("\n[8] torch.compile")
     model = RecurrentGPT(
         vocab_size=256, num_passes=2, model_dim=64, num_heads=4, num_kv_heads=2,
@@ -216,6 +243,7 @@ if __name__ == "__main__":
     test_qt_block()
     test_pass_delta()
     test_recurrent_gpt_forward()
+    test_recurrent_gpt_delta_modes()
     test_loss_decreases()
     test_param_count()
     test_compile()

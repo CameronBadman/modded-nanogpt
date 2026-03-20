@@ -1,21 +1,13 @@
 """
-QuadTree Weight Materialization with Sparse Delta Recurrence
-============================================================
-Novel architecture for the OpenAI parameter-golf competition (16MB budget).
+Sparse delta recurrence for parameter golf.
 
-Core ideas:
-  1. QuadTree weight materialization: each weight matrix is represented as a
-     sum of coarse-to-fine scalar grids (level 0 = 1 scalar covering the full
-     matrix, level L = 4^L scalars covering 1/4^L of the matrix each).
-     Only the scalar values are learned parameters — massive compression.
+The current training path is centered around a recurrent transformer:
+one shared transformer block is applied repeatedly, with a small
+per-pass adapter that can be ablated or shared across passes.
 
-  2. Sparse delta recurrence: one large base transformer block run N times.
-     Each recurrence pass has a tiny low-rank corrector (QuadTree LoRA style)
-     that specialises the pass. Base block compresses to ~2MB; 8 deltas ~200KB;
-     leaves ≥12MB headroom to widen the base block massively.
-
-The baseline GPT (9 blocks × dim 512) is preserved and selectable via
-USE_RECURRENT=0. The new RecurrentGPT is the default (USE_RECURRENT=1).
+Older baseline and QuadTree experiments are still kept in this file for
+reference and local tests, but the training entrypoint below is now
+explicitly recurrent-first.
 """
 
 from __future__ import annotations
@@ -75,7 +67,7 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Model shape (shared by both GPT and RecurrentGPT)
+    # Model shape
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -102,18 +94,10 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-    # ------------------------------------------------------------------
-    # QuadTree + Recurrence hyperparameters (new)
-    # ------------------------------------------------------------------
-    # Set USE_RECURRENT=0 to fall back to the baseline 9-block GPT.
-    use_recurrent = bool(int(os.environ.get("USE_RECURRENT", "1")))
-    # Number of times the single base block is applied.
+    # Recurrent architecture
     num_recurrent_passes = int(os.environ.get("NUM_RECURRENT_PASSES", "24"))
-    # Rank of per-pass low-rank corrector.
     delta_rank = int(os.environ.get("DELTA_RANK", "64"))
-    # QuadTree depth for delta corrector weights.
-    delta_quadtree_levels = int(os.environ.get("DELTA_QUADTREE_LEVELS", "5"))
-    # Truncated BPTT: detach hidden state every this many passes (0 = full BPTT).
+    delta_mode = os.environ.get("DELTA_MODE", "per_pass")
     tbptt_chunk = int(os.environ.get("TBPTT_CHUNK", "4"))
 
 
@@ -988,6 +972,25 @@ class PassDelta(nn.Module):
         return self.delta_scale.to(x.dtype) * self.up(h)
 
 
+class ScalarPassDelta(nn.Module):
+    """Tiny adapter for ablations: scale a normalized residual without matrices."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.norm = RMSNorm()
+        self.delta_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.delta_scale.to(x.dtype) * self.norm(x)
+
+
+class ZeroDelta(nn.Module):
+    """Adapter-free ablation."""
+
+    def forward(self, x: Tensor) -> Tensor:
+        return torch.zeros_like(x)
+
+
 # -----------------------------
 # RECURRENT GPT
 # -----------------------------
@@ -1020,6 +1023,7 @@ class RecurrentGPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         delta_rank: int,
+        delta_mode: str = "per_pass",
         tbptt_chunk: int = 4,
     ) -> None:
         super().__init__()
@@ -1029,6 +1033,8 @@ class RecurrentGPT(nn.Module):
         self.tbptt_chunk = tbptt_chunk
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
+        self.delta_mode = delta_mode
+        self.shared_delta: nn.Module | None = None
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         if tie_embeddings:
@@ -1038,10 +1044,7 @@ class RecurrentGPT(nn.Module):
             model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
             depth_scale=1.0 / math.sqrt(num_passes),
         )
-        self.pass_deltas = nn.ModuleList([
-            PassDelta(model_dim, delta_rank)
-            for _ in range(num_passes)
-        ])
+        self.pass_deltas = nn.ModuleList(self._build_pass_deltas(model_dim, delta_rank))
         # Per-pass embeddings: tell the shared block which pass it is executing.
         # Small init so they don't overpower the token signal at the start.
         self.pass_emb = nn.Embedding(num_passes, model_dim)
@@ -1054,6 +1057,23 @@ class RecurrentGPT(nn.Module):
         else:
             self.lm_head = CastedLinear(model_dim, vocab_size, bias=False)
 
+    def _build_pass_deltas(self, model_dim: int, delta_rank: int) -> list[nn.Module]:
+        if self.delta_mode == "per_pass":
+            return [PassDelta(model_dim, delta_rank) for _ in range(self.num_passes)]
+        if self.delta_mode == "shared":
+            self.shared_delta = PassDelta(model_dim, delta_rank)
+            return []
+        if self.delta_mode == "scalar":
+            return [ScalarPassDelta(model_dim) for _ in range(self.num_passes)]
+        if self.delta_mode == "none":
+            return [ZeroDelta() for _ in range(self.num_passes)]
+        raise ValueError(f"Unsupported DELTA_MODE={self.delta_mode!r}")
+
+    def _delta_for_pass(self, idx: int) -> nn.Module:
+        if self.shared_delta is not None:
+            return self.shared_delta
+        return self.pass_deltas[idx]
+
     def compute_logits(self, input_ids: Tensor) -> Tensor:
         """Returns (B, T, V) logits. Used for sliding-window eval."""
         x = self.tok_emb(input_ids)
@@ -1064,7 +1084,7 @@ class RecurrentGPT(nn.Module):
             # Inject pass identity into the anchor so the block behaves differently
             # each pass without needing separate weights.
             x = self.base_block(x, x0 + pass_offsets[i][None, None, :])
-            x = x + self.pass_deltas[i](x)
+            x = x + self._delta_for_pass(i)(x)
             if self.tbptt_chunk > 0 and (i + 1) % self.tbptt_chunk == 0 and (i + 1) < self.num_passes:
                 x = x.detach()
         x = self.final_norm(x)  # (B, T, D)
@@ -1178,133 +1198,72 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # ------------------------------------------------------------------
 
-    if args.use_recurrent:
-        log0(
-            f"architecture:recurrent_gpt num_passes:{args.num_recurrent_passes} "
-            f"delta_rank:{args.delta_rank} pass_emb:yes tbptt_chunk:{args.tbptt_chunk}"
-        )
-        base_model = RecurrentGPT(
-            vocab_size=args.vocab_size,
-            num_passes=args.num_recurrent_passes,
-            model_dim=args.model_dim,
-            num_heads=args.num_heads,
-            num_kv_heads=args.num_kv_heads,
-            mlp_mult=args.mlp_mult,
-            tie_embeddings=args.tie_embeddings,
-            tied_embed_init_std=args.tied_embed_init_std,
-            logit_softcap=args.logit_softcap,
-            rope_base=args.rope_base,
-            qk_gain_init=args.qk_gain_init,
-            delta_rank=args.delta_rank,
-            tbptt_chunk=args.tbptt_chunk,
-        ).to(device).bfloat16()
-        # Keep CastedLinear weights in fp32 (base_block + pass_delta projections)
-        for module in base_model.modules():
-            if isinstance(module, CastedLinear):
-                module.float()
-        restore_low_dim_params_to_fp32(base_model)
+    log0(
+        f"architecture:recurrent_gpt num_passes:{args.num_recurrent_passes} "
+        f"delta_mode:{args.delta_mode} delta_rank:{args.delta_rank} "
+        f"pass_emb:yes tbptt_chunk:{args.tbptt_chunk}"
+    )
+    base_model = RecurrentGPT(
+        vocab_size=args.vocab_size,
+        num_passes=args.num_recurrent_passes,
+        model_dim=args.model_dim,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        mlp_mult=args.mlp_mult,
+        tie_embeddings=args.tie_embeddings,
+        tied_embed_init_std=args.tied_embed_init_std,
+        logit_softcap=args.logit_softcap,
+        rope_base=args.rope_base,
+        qk_gain_init=args.qk_gain_init,
+        delta_rank=args.delta_rank,
+        delta_mode=args.delta_mode,
+        tbptt_chunk=args.tbptt_chunk,
+    ).to(device).bfloat16()
+    for module in base_model.modules():
+        if isinstance(module, CastedLinear):
+            module.float()
+    restore_low_dim_params_to_fp32(base_model)
 
-        # base_block 2D weights + PassDelta down/up projections → Muon
-        # (both are linear projections that benefit from orthogonalisation)
-        base_block_matrix_params = [
-            p for name, p in base_model.base_block.named_parameters()
-            if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
-        ]
-        delta_matrix_params = [
-            p for name, p in base_model.pass_deltas.named_parameters()
-            if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
-        ]
-        all_matrix_params = base_block_matrix_params + delta_matrix_params
-        scalar_params = [
-            p for name, p in base_model.named_parameters()
-            if "tok_emb" not in name
-            and (base_model.lm_head is None or "lm_head" not in name)
-            and id(p) not in {id(q) for q in all_matrix_params}
-        ]
-        token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-        optimizer_tok = torch.optim.Adam(
-            [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+    matrix_params = [
+        p for name, p in base_model.named_parameters()
+        if p.ndim == 2
+        and "tok_emb" not in name
+        and (base_model.lm_head is None or "lm_head" not in name)
+        and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    matrix_param_ids = {id(p) for p in matrix_params}
+    scalar_params = [
+        p for name, p in base_model.named_parameters()
+        if "tok_emb" not in name
+        and (base_model.lm_head is None or "lm_head" not in name)
+        and id(p) not in matrix_param_ids
+    ]
+    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    optimizer_tok = torch.optim.Adam(
+        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
+    )
+    optimizer_scalar = torch.optim.Adam(
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
+    )
+    optimizer_muon = Muon(
+        [{"params": matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
+        lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps,
+    )
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_scalar, optimizer_muon]
+    if base_model.lm_head is not None:
+        optimizer_head = torch.optim.Adam(
+            [{"params": list(base_model.lm_head.parameters()), "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
         )
-        optimizer_scalar = torch.optim.Adam(
-            [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-            betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
-        )
-        optimizer_muon = Muon(
-            [{"params": all_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
-            lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps,
-        )
-        optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_scalar, optimizer_muon]
-        if base_model.lm_head is not None:
-            optimizer_head = torch.optim.Adam(
-                [{"params": list(base_model.lm_head.parameters()), "lr": args.head_lr, "base_lr": args.head_lr}],
-                betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
-            )
-            optimizers.insert(1, optimizer_head)
+        optimizers.insert(1, optimizer_head)
 
-    else:
-        log0("architecture:gpt (baseline)")
-        base_model = GPT(
-            vocab_size=args.vocab_size,
-            num_layers=args.num_layers,
-            model_dim=args.model_dim,
-            num_heads=args.num_heads,
-            num_kv_heads=args.num_kv_heads,
-            mlp_mult=args.mlp_mult,
-            tie_embeddings=args.tie_embeddings,
-            tied_embed_init_std=args.tied_embed_init_std,
-            logit_softcap=args.logit_softcap,
-            rope_base=args.rope_base,
-            qk_gain_init=args.qk_gain_init,
-        ).to(device).bfloat16()
-        for module in base_model.modules():
-            if isinstance(module, CastedLinear):
-                module.float()
-        restore_low_dim_params_to_fp32(base_model)
-
-        block_named_params = list(base_model.blocks.named_parameters())
-        matrix_params = [
-            p for name, p in block_named_params
-            if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-        ]
-        scalar_params = [
-            p for name, p in block_named_params
-            if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-        ]
-        if base_model.skip_weights.numel() > 0:
-            scalar_params.append(base_model.skip_weights)
-        token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-        optimizer_tok = torch.optim.Adam(
-            [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizer_muon = Muon(
-            matrix_params,
-            lr=args.matrix_lr,
-            momentum=args.muon_momentum,
-            backend_steps=args.muon_backend_steps,
-        )
-        for group in optimizer_muon.param_groups:
-            group["base_lr"] = args.matrix_lr
-        optimizer_scalar = torch.optim.Adam(
-            [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
-        if base_model.lm_head is not None:
-            optimizer_head = torch.optim.Adam(
-                [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
-                betas=(args.beta1, args.beta2),
-                eps=args.adam_eps,
-                fused=True,
-            )
-            optimizers.insert(1, optimizer_head)
-
+    torch.cuda.synchronize()
+    t_compile_start = time.perf_counter()
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False, options={"max_fusion_size": 4})
+    torch.cuda.synchronize()
+    compile_time_ms = 1000.0 * (time.perf_counter() - t_compile_start)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     n_params = sum(p.numel() for p in base_model.parameters())
@@ -1324,6 +1283,7 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     compressor_tag = f"zstd(22)" if _HAVE_ZSTD else "zlib(9)"
     log0(f"quantization:int{QUANT_BITS}+{compressor_tag} val_eval_stride:{args.val_eval_stride}")
+    log0(f"compile_time:{compile_time_ms:.0f}ms")
 
     # ------------------------------------------------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1380,6 +1340,8 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    timing_totals = dict(data=0.0, forward_backward=0.0, optimizer=0.0, validation=0.0)
+    validation_calls = 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1391,13 +1353,19 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            t_val_start = time.perf_counter()
             val_loss, val_bpb = eval_val(
                 args, model, rank, world_size, device, grad_accum_steps,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             )
+            torch.cuda.synchronize()
+            val_time_ms = 1000.0 * (time.perf_counter() - t_val_start)
+            timing_totals["validation"] += val_time_ms
+            validation_calls += 1
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
+                f"val_time:{val_time_ms:.0f}ms"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1414,15 +1382,27 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        step_data_ms = 0.0
+        step_forward_backward_ms = 0.0
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+            torch.cuda.synchronize()
+            t_data_start = time.perf_counter()
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            torch.cuda.synchronize()
+            step_data_ms += 1000.0 * (time.perf_counter() - t_data_start)
+            torch.cuda.synchronize()
+            t_fb_start = time.perf_counter()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
+            torch.cuda.synchronize()
+            step_forward_backward_ms += 1000.0 * (time.perf_counter() - t_fb_start)
         train_loss /= grad_accum_steps
+        timing_totals["data"] += step_data_ms
+        timing_totals["forward_backward"] += step_forward_backward_ms
 
         if optimizer_muon is not None:
             frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
@@ -1436,8 +1416,13 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        torch.cuda.synchronize()
+        t_opt_start = time.perf_counter()
         for opt in optimizers:
             opt.step()
+        torch.cuda.synchronize()
+        step_optimizer_ms = 1000.0 * (time.perf_counter() - t_opt_start)
+        timing_totals["optimizer"] += step_optimizer_ms
         zero_grad_all()
 
         step += 1
@@ -1447,9 +1432,12 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            tokens_per_s = args.train_batch_tokens / max((step_data_ms + step_forward_backward_ms + step_optimizer_ms) / 1000.0, 1e-9)
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"data:{step_data_ms:.1f}ms fb:{step_forward_backward_ms:.1f}ms "
+                f"opt:{step_optimizer_ms:.1f}ms tok/s:{tokens_per_s:.0f}"
             )
 
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1464,6 +1452,14 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if step > 0:
+        log0(
+            "timing_breakdown_avg "
+            f"data:{timing_totals['data'] / step:.2f}ms "
+            f"fb:{timing_totals['forward_backward'] / step:.2f}ms "
+            f"opt:{timing_totals['optimizer'] / step:.2f}ms "
+            f"val:{timing_totals['validation'] / max(validation_calls, 1):.2f}ms"
+        )
 
     # ------------------------------------------------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
